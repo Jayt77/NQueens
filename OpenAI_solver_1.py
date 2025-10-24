@@ -19,9 +19,9 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 EPSILON = 1e-6
-MAX_WAREHOUSE_VISITS = 6
-MAX_ORDER_ATTEMPTS = 10
-MAX_MISSIONS_PER_VEHICLE = 4
+BASE_MAX_WAREHOUSE_VISITS = 6
+BASE_MAX_ORDER_ATTEMPTS = 10
+MAX_MISSIONS_PER_VEHICLE: Optional[int] = None
 
 
 @dataclass
@@ -111,8 +111,11 @@ def solver(env) -> Dict[str, List[Dict[str, object]]]:
         ]
         missions_completed = 0
         skipped_orders: set[str] = set()
+        max_order_attempts = max(BASE_MAX_ORDER_ATTEMPTS, len(outstanding_orders)) or BASE_MAX_ORDER_ATTEMPTS
 
-        while missions_completed < MAX_MISSIONS_PER_VEHICLE and _has_pending_orders(outstanding_orders):
+        while _has_pending_orders(outstanding_orders):
+            if MAX_MISSIONS_PER_VEHICLE is not None and missions_completed >= MAX_MISSIONS_PER_VEHICLE:
+                break
             next_order = _select_order(
                 vehicle_state,
                 outstanding_orders,
@@ -137,7 +140,7 @@ def solver(env) -> Dict[str, List[Dict[str, object]]]:
 
             if mission is None:
                 skipped_orders.add(next_order)
-                if len(skipped_orders) >= MAX_ORDER_ATTEMPTS:
+                if len(skipped_orders) >= max_order_attempts:
                     break
                 continue
 
@@ -197,13 +200,17 @@ def _plan_mission(
     current_node = vehicle_state.node_id
     capacity_weight_left = vehicle_state.remaining_weight()
     capacity_volume_left = vehicle_state.remaining_volume()
+    local_inventory: Dict[str, Dict[str, float]] = {
+        wid: dict(stock) for wid, stock in warehouse_inventory.items()
+    }
 
     order_to_home_path = _shortest_path(env, adjacency, order_node, home_node)
     if not order_to_home_path:
         return None
     order_to_home_distance = _path_distance(env, order_to_home_path)
 
-    for _ in range(MAX_WAREHOUSE_VISITS):
+    max_visits = max(BASE_MAX_WAREHOUSE_VISITS, len(warehouse_inventory))
+    for _ in range(max_visits):
         need_remaining = {
             sku: max(0.0, qty - delivered.get(sku, 0.0))
             for sku, qty in required.items()
@@ -212,15 +219,34 @@ def _plan_mission(
         if not need_remaining:
             break
 
-        best_choice = None
-        best_info = None
-        for warehouse_id, inventory in warehouse_inventory.items():
-            pickup_options = {}
+        best_choice: Optional[Tuple[str, List[int], List[Tuple[str, float]], float]] = None
+        best_rank: Optional[Tuple[float, float, float]] = None
+        for warehouse_id, inventory in local_inventory.items():
+            temp_weight = capacity_weight_left
+            temp_volume = capacity_volume_left
+            feasible_pickups: List[Tuple[str, float]] = []
+            feasible_total = 0.0
             for sku, qty_needed in need_remaining.items():
                 available = inventory.get(sku, 0.0)
-                if available > EPSILON:
-                    pickup_options[sku] = min(qty_needed, available)
-            if not pickup_options:
+                if available <= EPSILON:
+                    continue
+                demand = min(qty_needed, available)
+                weight_per_unit, volume_per_unit = sku_dimensions.get(sku, (0.0, 0.0))
+                max_qty = demand
+                if weight_per_unit > EPSILON and temp_weight is not None and not math.isinf(temp_weight):
+                    max_qty = min(max_qty, temp_weight / weight_per_unit)
+                if volume_per_unit > EPSILON and temp_volume is not None and not math.isinf(temp_volume):
+                    max_qty = min(max_qty, temp_volume / volume_per_unit)
+                max_qty = max(0.0, max_qty)
+                if max_qty <= EPSILON:
+                    continue
+                feasible_pickups.append((sku, max_qty))
+                feasible_total += max_qty
+                if weight_per_unit > EPSILON and temp_weight is not None and not math.isinf(temp_weight):
+                    temp_weight = max(0.0, temp_weight - weight_per_unit * max_qty)
+                if volume_per_unit > EPSILON and temp_volume is not None and not math.isinf(temp_volume):
+                    temp_volume = max(0.0, temp_volume - volume_per_unit * max_qty)
+            if feasible_total <= EPSILON:
                 continue
 
             warehouse_node = _warehouse_node(env, warehouse_id)
@@ -228,58 +254,58 @@ def _plan_mission(
             if not path_to_wh:
                 continue
             dist_to_wh = _path_distance(env, path_to_wh)
+            if math.isinf(dist_to_wh):
+                continue
 
             path_wh_to_order = _shortest_path(env, adjacency, warehouse_node, order_node)
             if not path_wh_to_order:
                 continue
             dist_wh_to_order = _path_distance(env, path_wh_to_order)
+            if math.isinf(dist_wh_to_order):
+                continue
 
             projected_distance = mission_distance + dist_to_wh + dist_wh_to_order + order_to_home_distance
             if vehicle_state.distance_travelled + projected_distance > distance_budget + EPSILON:
                 continue
 
-            if best_info is None or dist_to_wh < best_info[0]:
-                best_info = (dist_to_wh, warehouse_id, path_to_wh)
-                best_choice = (warehouse_id, pickup_options, path_to_wh)
+            rank = (
+                -feasible_total,
+                dist_to_wh + dist_wh_to_order,
+                dist_to_wh,
+            )
+            if best_rank is None or rank < best_rank:
+                best_rank = rank
+                best_choice = (warehouse_id, path_to_wh, feasible_pickups, dist_to_wh)
 
         if best_choice is None:
             break
 
-        warehouse_id, pickup_options, path_to_wh = best_choice
+        warehouse_id, path_to_wh, feasible_pickups, dist_to_wh = best_choice
         warehouse_node = path_to_wh[-1]
         actual_pickups: List[Dict[str, object]] = []
-        picked_any = False
 
-        for sku, possible_qty in pickup_options.items():
-            weight_per_unit, volume_per_unit = sku_dimensions.get(sku, (0.0, 0.0))
-            if weight_per_unit <= EPSILON and volume_per_unit <= EPSILON:
-                max_by_capacity = possible_qty
-            else:
-                max_by_weight = possible_qty
-                max_by_volume = possible_qty
-                if weight_per_unit > EPSILON:
-                    max_by_weight = min(possible_qty, capacity_weight_left / weight_per_unit)
-                if volume_per_unit > EPSILON:
-                    max_by_volume = min(possible_qty, capacity_volume_left / volume_per_unit)
-                max_by_capacity = min(possible_qty, max_by_weight, max_by_volume)
-            qty = max(0.0, max_by_capacity)
+        for sku, qty in feasible_pickups:
             if qty <= EPSILON:
                 continue
-
-            capacity_weight_left -= weight_per_unit * qty
-            capacity_volume_left -= volume_per_unit * qty
+            weight_per_unit, volume_per_unit = sku_dimensions.get(sku, (0.0, 0.0))
+            if weight_per_unit > EPSILON and capacity_weight_left is not None and not math.isinf(capacity_weight_left):
+                capacity_weight_left = max(0.0, capacity_weight_left - weight_per_unit * qty)
+            if volume_per_unit > EPSILON and capacity_volume_left is not None and not math.isinf(capacity_volume_left):
+                capacity_volume_left = max(0.0, capacity_volume_left - volume_per_unit * qty)
             delivered[sku] += qty
+            local_stock = local_inventory.get(warehouse_id, {})
+            if sku in local_stock:
+                local_stock[sku] = max(0.0, local_stock.get(sku, 0.0) - qty)
             actual_pickups.append({
                 "warehouse_id": warehouse_id,
                 "sku_id": sku,
                 "quantity": qty,
             })
-            picked_any = True
 
-        if not picked_any:
+        if not actual_pickups:
             continue
 
-        mission_distance += _path_distance(env, path_to_wh)
+        mission_distance += dist_to_wh
         pickup_segments.append((path_to_wh, actual_pickups))
         current_node = warehouse_node
 
