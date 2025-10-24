@@ -498,16 +498,23 @@ def _load_sku_dimensions(env) -> Dict[str, Tuple[float, float]]:
 
 def _snapshot_inventory(env) -> Dict[str, Dict[str, float]]:
     snapshot: Dict[str, Dict[str, float]] = {}
-    for warehouse_id, warehouse in env.warehouses.items():
-        inventory = getattr(warehouse, "inventory", {}) or {}
+    for warehouse_id in env.warehouses:
+        try:
+            inventory = env.get_warehouse_inventory(warehouse_id)
+        except AttributeError:
+            inventory = getattr(env.warehouses[warehouse_id], "inventory", {}) or {}
         snapshot[warehouse_id] = {sku: float(qty) for sku, qty in inventory.items()}
     return snapshot
 
 
 def _load_orders(env) -> Dict[str, Dict[str, float]]:
     outstanding: Dict[str, Dict[str, float]] = {}
-    for order_id, order in env.orders.items():
-        items = getattr(order, "requested_items", {}) or {}
+    for order_id in env.get_all_order_ids():
+        try:
+            items = env.get_order_requirements(order_id)
+        except AttributeError:
+            order = env.orders[order_id]
+            items = getattr(order, "requested_items", {}) or {}
         outstanding[order_id] = {sku: float(qty) for sku, qty in items.items() if qty > EPSILON}
     return outstanding
 
@@ -538,16 +545,26 @@ def _initialise_vehicle_state(vehicle, env) -> Optional[VehicleState]:
 
 
 def _vehicle_capacity(env, vehicle, vehicle_id: str) -> Tuple[Optional[float], Optional[float]]:
-    capacity = getattr(vehicle, "capacity", None)
-    if isinstance(capacity, (tuple, list)) and len(capacity) >= 2:
-        return float(capacity[0]), float(capacity[1])
-    weight_cap = getattr(vehicle, "max_weight", None)
-    volume_cap = getattr(vehicle, "max_volume", None)
+    weight_cap = getattr(vehicle, "capacity_weight", None)
+    volume_cap = getattr(vehicle, "capacity_volume", None)
     if weight_cap is not None or volume_cap is not None:
         return (
             float(weight_cap) if weight_cap is not None else None,
             float(volume_cap) if volume_cap is not None else None,
         )
+
+    legacy_weight = getattr(vehicle, "max_weight", None)
+    legacy_volume = getattr(vehicle, "max_volume", None)
+    if legacy_weight is not None or legacy_volume is not None:
+        return (
+            float(legacy_weight) if legacy_weight is not None else None,
+            float(legacy_volume) if legacy_volume is not None else None,
+        )
+
+    capacity = getattr(vehicle, "capacity", None)
+    if isinstance(capacity, (tuple, list)) and len(capacity) >= 2:
+        return float(capacity[0]), float(capacity[1])
+
     if hasattr(env, "get_vehicle_remaining_capacity"):
         try:
             weight, volume = env.get_vehicle_remaining_capacity(vehicle_id)
