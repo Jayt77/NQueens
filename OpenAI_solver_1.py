@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import heapq
 import math
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -596,14 +597,33 @@ def _location_node(location) -> int:
     if isinstance(location, (int, float)):
         return int(location)
     if isinstance(location, str) and location.strip():
+        text = location.strip()
         try:
-            return int(location)
+            return int(text)
         except ValueError:
-            pass
+            match = re.search(r"-?\d+", text)
+            if match:
+                return int(match.group(0))
+    try:
+        return int(location)
+    except (TypeError, ValueError):
+        pass
     if hasattr(location, "id") and location.id is not None:
         return int(location.id)
     if hasattr(location, "node_id") and location.node_id is not None:
         return int(location.node_id)
+    if hasattr(location, "nodeId") and location.nodeId is not None:
+        return int(location.nodeId)
+    if hasattr(location, "location_id") and location.location_id is not None:
+        return int(location.location_id)
+    if hasattr(location, "locationId") and location.locationId is not None:
+        return int(location.locationId)
+    alt = getattr(location, "value", None)
+    if alt is not None:
+        return _location_node(alt)
+    alt = getattr(location, "destination", None)
+    if alt is not None:
+        return _location_node(alt)
     nested = getattr(location, "location", None)
     if nested is not None:
         return _location_node(nested)
@@ -611,14 +631,23 @@ def _location_node(location) -> int:
     if nested is not None:
         return _location_node(nested)
     if isinstance(location, dict):
-        if "id" in location and location["id"] is not None:
-            return int(location["id"])
-        if "node_id" in location and location["node_id"] is not None:
-            return int(location["node_id"])
-        if "location" in location and location["location"] is not None:
-            return _location_node(location["location"])
-        if "node" in location and location["node"] is not None:
-            return _location_node(location["node"])
+        for key in ("id", "node_id", "nodeId", "location_id", "locationId"):
+            value = location.get(key)
+            if value is not None:
+                return _location_node(value)
+        for key in ("location", "node", "value", "destination"):
+            if key in location and location[key] is not None:
+                return _location_node(location[key])
+    if isinstance(location, (list, tuple)) and location:
+        return _location_node(location[0])
+    if hasattr(location, "__dict__"):
+        attrs = {k: v for k, v in vars(location).items() if not k.startswith("_")}
+        for key in ("id", "node_id", "nodeId", "location_id", "locationId"):
+            if key in attrs and attrs[key] is not None:
+                return _location_node(attrs[key])
+        for key in ("location", "node", "value", "destination"):
+            if key in attrs and attrs[key] is not None:
+                return _location_node(attrs[key])
     raise ValueError("Unsupported location format")
 
 
