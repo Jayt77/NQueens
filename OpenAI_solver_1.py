@@ -593,15 +593,32 @@ def _warehouse_node(env, warehouse_id: str) -> Optional[int]:
 def _location_node(location) -> int:
     if location is None:
         raise ValueError("Order location missing node id")
+    if isinstance(location, (int, float)):
+        return int(location)
+    if isinstance(location, str) and location.strip():
+        try:
+            return int(location)
+        except ValueError:
+            pass
     if hasattr(location, "id") and location.id is not None:
         return int(location.id)
     if hasattr(location, "node_id") and location.node_id is not None:
         return int(location.node_id)
+    nested = getattr(location, "location", None)
+    if nested is not None:
+        return _location_node(nested)
+    nested = getattr(location, "node", None)
+    if nested is not None:
+        return _location_node(nested)
     if isinstance(location, dict):
         if "id" in location and location["id"] is not None:
             return int(location["id"])
         if "node_id" in location and location["node_id"] is not None:
             return int(location["node_id"])
+        if "location" in location and location["location"] is not None:
+            return _location_node(location["location"])
+        if "node" in location and location["node"] is not None:
+            return _location_node(location["node"])
     raise ValueError("Unsupported location format")
 
 
